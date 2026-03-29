@@ -1,0 +1,115 @@
+name: Cosmic Kernel CI-Sky
+
+on:
+  workflow_dispatch:
+
+jobs:
+  Kernel_Build_CI:
+    name: Cosmic Kernel Build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      TG_BOT: "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}"
+      CHAT_ID: "${{ secrets.TG_CHAT_ID }}"
+      WORKSPACE: "${{ github.workspace }}"
+
+    steps:
+      - name: Build Execution
+        run: |
+          # 1. Initialize Log and Start Time
+          LOG_FILE="$WORKSPACE/full_build_log.txt"
+          touch "$LOG_FILE"
+          exec > >(tee -a "$LOG_FILE") 2>&1
+          
+          echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
+          
+          echo "Optimizing Environment..."
+          sudo apt-get update -qq
+          sudo apt-get install -y jq bc bison build-essential flex libssl-dev libelf-dev openjdk-17-jre-headless lsb-release wget zip openssl
+
+          echo "Setting up 12GB Swap..."
+          sudo swapoff -a
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+
+          echo "Cloning Sky Sources..."
+          git clone https://github.com/lostark13/kernel_xiaomi_sky.git --depth=1 -b main kernel
+          git clone https://github.com/lostark13/kernel_xiaomi_sky-modules.git --depth=1 -b main modules
+          
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            --progress --depth=1 --filter=blob:none -b main clang-repo
+          mkdir clang
+          mv clang-repo/clang-r522859/* clang/
+          rm -rf clang-repo
+
+          cd kernel
+          TOP_COMMIT=$(git rev-parse --short HEAD)
+          echo "COMMIT_SHA=$TOP_COMMIT" >> $GITHUB_ENV
+          
+          # Trigger Notification
+          MESSAGE="Build Triggered ⌛%0AKernel : Cosmic-v5.10.251-Sky%0ASupport : Android 16.0%0AVariant : GKI Stable%0AMachine : Ubuntu 24.04.3 LTS%0ACores : $(nproc --all)%0ATime : $(date +'%a %b %d %I:%M:%S %p')%0ATop Commit : $TOP_COMMIT zram: fix race between zram_reset_device() and disksize_store()."
+          curl -s -X POST "${{ env.TG_BOT }}/sendMessage" -d chat_id="${{ env.CHAT_ID }}" -d text="$MESSAGE"
+
+          # Setup Signing
+          mkdir -p certs
+          openssl genrsa -out certs/signing_key.pem 4096
+          openssl req -new -x509 -key certs/signing_key.pem -out certs/signing_key.x509 -nodes -days 36500 -subj "/C=IN/ST=India/L=Zeus/O=Cosmic/CN=Zeus"
+
+          export PATH=$WORKSPACE/clang/bin:$PATH
+          MAKE_ARGS="ARCH=arm64 CC=clang NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LD=ld.lld CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1"
+
+          # Build Kernel with LTO
+          make O=out $MAKE_ARGS gki_defconfig
+          scripts/config --file out/.config -e LTO_CLANG_FULL
+          scripts/config --file out/.config -e MODULE_SIG
+          scripts/config --file out/.config -e MODULE_SIG_ALL
+          
+          make -j$(nproc --all) O=out $MAKE_ARGS || exit 1
+
+          # Build & Sign Modules
+          make -j$(nproc --all) O=out $MAKE_ARGS M=$WORKSPACE/modules modules
+          find $WORKSPACE/modules -name "*.ko" -exec ./scripts/sign-file sha256 certs/signing_key.pem certs/signing_key.x509 {} +
+
+      - name: Handle Success
+        if: success()
+        run: |
+          mkdir -p $WORKSPACE/output
+          cp kernel/out/arch/arm64/boot/Image $WORKSPACE/output/
+          find $WORKSPACE/modules -name "*.ko" -exec cp {} $WORKSPACE/output/ \;
+
+          cd $WORKSPACE/output
+          zip -r9 $WORKSPACE/Cosmic-Sky-Signed.zip *
+          
+          END_TIME=$(date +%s)
+          DIFF=$(( END_TIME - ${{ env.START_TIME }} ))
+          MD5_CHECK=$(md5sum $WORKSPACE/Cosmic-Sky-Signed.zip | cut -d' ' -f1)
+          
+          CAPTION=$(printf "✅ Build Success\n\n🆔 Commit: ${{ env.COMMIT_SHA }}\n📦 Build took : $(( DIFF / 60 )) minute(s) and $(( DIFF % 60 )) second(s)\n🔑 MD5 Checksum : $MD5_CHECK")
+
+          curl -F chat_id="${{ env.CHAT_ID }}" \
+               -F document=@"$WORKSPACE/Cosmic-Sky-Signed.zip" \
+               -F caption="$CAPTION" \
+               "${{ env.TG_BOT }}/sendDocument"
+
+      - name: Handle Failure
+        if: failure()
+        run: |
+          LOG_FILE="$WORKSPACE/full_build_log.txt"
+          ERROR_LOG="$WORKSPACE/build_log.txt"
+
+          # Get the last 1000 lines for debugging
+          if [ -f "$LOG_FILE" ]; then
+            tail -n 1000 "$LOG_FILE" > "$ERROR_LOG"
+          else
+            echo "Build failed before log initialization." > "$ERROR_LOG"
+          fi
+
+          CAPTION=$(printf "❌ Build Failed\n\n🆔 Commit: ${{ env.COMMIT_SHA }}\n\nReview the attached build_log.txt for details.")
+
+          curl -F chat_id="${{ env.CHAT_ID }}" \
+               -F document=@"$ERROR_LOG" \
+               -F caption="$CAPTION" \
+               "${{ env.TG_BOT }}/sendDocument"
+               
