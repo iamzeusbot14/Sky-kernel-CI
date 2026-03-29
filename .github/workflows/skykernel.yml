@@ -7,7 +7,6 @@ jobs:
   Kernel_Build_CI:
     name: Cosmic Kernel Build
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
     env:
       TG_BOT: "https://api.telegram.org/bot${{ secrets.TG_TOKEN }}"
       CHAT_ID: "${{ secrets.TG_CHAT_ID }}"
@@ -16,16 +15,14 @@ jobs:
     steps:
       - name: Build Execution
         run: |
-          # 1. Initialize Log and Start Time
+          # 1. Setup Logs & Environment
           LOG_FILE="$WORKSPACE/full_build_log.txt"
           touch "$LOG_FILE"
           exec > >(tee -a "$LOG_FILE") 2>&1
-          
           echo "START_TIME=$(date +%s)" >> $GITHUB_ENV
-          
+
           echo "Installing Dependencies..."
-          sudo apt-get update -qq
-          sudo apt-get install -y jq bc bison build-essential flex libssl-dev libelf-dev openjdk-17-jre-headless lsb-release wget zip openssl
+          sudo apt-get update -qq && sudo apt-get install -y jq bc bison build-essential flex libssl-dev libelf-dev openjdk-17-jre-headless lsb-release wget zip openssl
 
           echo "Setting up 12GB Swap..."
           sudo swapoff -a
@@ -34,51 +31,54 @@ jobs:
           sudo mkswap /swapfile
           sudo swapon /swapfile
 
-          echo "Cloning Sky Sources (Branch: lineage-23.1)..."
+          # 2. Clone Sources
           git clone https://github.com/lostark13/kernel_xiaomi_sky.git --depth=1 -b lineage-23.1 kernel
           git clone https://github.com/lostark13/kernel_xiaomi_sky-modules.git --depth=1 -b lineage-23.1 modules
+
+          # 3. FIXED: Reliable Clang Setup
+          # Using --filter=blob:none to speed up the clone of the large toolchain repo
+          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 --depth=1 --filter=blob:none -b main clang-repo
           
-          echo "Fetching Toolchains..."
-          # Fix: Use --filter=blob:none for faster cloning and dynamic folder moving
-          git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
-            --progress --depth=1 --filter=blob:none -b main clang-repo
-          
-          # Dynamic Find: Moves any clang-r* folder content to 'clang' to avoid "stat failed" errors
+          # This finds the actual folder (e.g., clang-r522859) and moves it to 'clang'
           mkdir -p clang
-          find clang-repo -maxdepth 2 -name "clang-r522859" -type d -exec cp -r {}/. clang/ \;
+          CLANG_FOLDER=$(find clang-repo -maxdepth 1 -type d -name "clang-r*")
+          if [ -d "$CLANG_FOLDER" ]; then
+              cp -r "$CLANG_FOLDER"/* clang/
+              echo "Clang toolchain moved successfully."
+          else
+              echo "ERROR: Clang folder not found!" && exit 1
+          fi
           rm -rf clang-repo
 
-          # Pull GCC for cross-compilation support
-          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
-            --depth=1 -b lineage-19.1 gcc-64
+          git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git --depth=1 -b lineage-19.1 gcc-64
 
+          # 4. FIXED: Real Commit Data for Notification
           cd kernel
-          TOP_COMMIT=$(git rev-parse --short HEAD)
-          echo "COMMIT_SHA=$TOP_COMMIT" >> $GITHUB_ENV
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s")
+          echo "COMMIT_SHA=$COMMIT_SHA" >> $GITHUB_ENV
           
-          # [span_1](start_span)Telegram Trigger Notification[span_1](end_span)
-          MESSAGE="Build Triggered ⌛%0AKernel : Cosmic-v5.10.251-Sky%0ASupport : Android 16.0%0AVariant : GKI Stable%0AMachine : Ubuntu 24.04.3 LTS%0ACores : $(nproc --all)%0ATime : $(date +'%a %b %d %I:%M:%S %p')%0ATop Commit : $TOP_COMMIT zram: fix race between zram_reset_device() and disksize_store()."
+          # Telegram Notification (Dynamic Commit Info)
+          MESSAGE="Build Triggered ⌛%0AKernel : Cosmic-v5.10.251-Sky%0ASupport : Android 16.0%0AVariant : GKI Stable%0AMachine : Ubuntu 24.04.3 LTS%0ACores : $(nproc --all)%0ATime : $(date +'%a %b %d %I:%M:%S %p')%0ATop Commit : $COMMIT_SHA $COMMIT_MSG"
           curl -s -X POST "${{ env.TG_BOT }}/sendMessage" -d chat_id="${{ env.CHAT_ID }}" -d text="$MESSAGE"
 
-          # Signing Setup
+          # 5. Build Paths & Signing
           mkdir -p certs
           openssl genrsa -out certs/signing_key.pem 4096
           openssl req -new -x509 -key certs/signing_key.pem -out certs/signing_key.x509 -nodes -days 36500 -subj "/C=IN/ST=India/L=Zeus/O=Cosmic/CN=Zeus"
 
-          # Path & Build Arguments
           export PATH=$WORKSPACE/clang/bin:$WORKSPACE/gcc-64/bin:$PATH
           MAKE_ARGS="ARCH=arm64 CC=clang NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip LD=ld.lld CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_COMPAT=arm-linux-gnueabi- LLVM=1 LLVM_IAS=1"
 
-          # Configure & Build with LTO
+          # 6. Build with LTO
           make O=out $MAKE_ARGS gki_defconfig
           scripts/config --file out/.config -e LTO_CLANG_FULL
           scripts/config --file out/.config -e MODULE_SIG
           scripts/config --file out/.config -e MODULE_SIG_ALL
           
-          # [span_2](start_span)Main Kernel Build[span_2](end_span)
           make -j$(nproc --all) O=out $MAKE_ARGS || exit 1
 
-          # Build & Sign Modules
+          # 7. Build & Sign Modules
           make -j$(nproc --all) O=out $MAKE_ARGS M=$WORKSPACE/modules modules
           find $WORKSPACE/modules -name "*.ko" -exec ./scripts/sign-file sha256 certs/signing_key.pem certs/signing_key.x509 {} +
 
