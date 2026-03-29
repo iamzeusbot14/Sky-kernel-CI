@@ -16,6 +16,7 @@ jobs:
     steps:
       - name: Build Execution
         run: |
+          # 1. Initialize Log and Start Time
           LOG_FILE="$WORKSPACE/full_build_log.txt"
           touch "$LOG_FILE"
           exec > >(tee -a "$LOG_FILE") 2>&1
@@ -38,10 +39,16 @@ jobs:
           git clone https://github.com/lostark13/kernel_xiaomi_sky-modules.git --depth=1 -b lineage-23.1 modules
           
           echo "Fetching Toolchains..."
+          # Fix: Use --filter=blob:none for faster cloning and dynamic folder moving
           git clone https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
             --progress --depth=1 --filter=blob:none -b main clang-repo
-          mkdir clang && mv clang-repo/clang-r522859/* clang/ && rm -rf clang-repo
+          
+          # Dynamic Find: Moves any clang-r* folder content to 'clang' to avoid "stat failed" errors
+          mkdir -p clang
+          find clang-repo -maxdepth 2 -name "clang-r522859" -type d -exec cp -r {}/. clang/ \;
+          rm -rf clang-repo
 
+          # Pull GCC for cross-compilation support
           git clone https://github.com/LineageOS/android_prebuilts_gcc_linux-x86_aarch64_aarch64-linux-android-4.9.git \
             --depth=1 -b lineage-19.1 gcc-64
 
@@ -49,7 +56,7 @@ jobs:
           TOP_COMMIT=$(git rev-parse --short HEAD)
           echo "COMMIT_SHA=$TOP_COMMIT" >> $GITHUB_ENV
           
-          # Telegram Trigger Notification
+          # [span_1](start_span)Telegram Trigger Notification[span_1](end_span)
           MESSAGE="Build Triggered ⌛%0AKernel : Cosmic-v5.10.251-Sky%0ASupport : Android 16.0%0AVariant : GKI Stable%0AMachine : Ubuntu 24.04.3 LTS%0ACores : $(nproc --all)%0ATime : $(date +'%a %b %d %I:%M:%S %p')%0ATop Commit : $TOP_COMMIT zram: fix race between zram_reset_device() and disksize_store()."
           curl -s -X POST "${{ env.TG_BOT }}/sendMessage" -d chat_id="${{ env.CHAT_ID }}" -d text="$MESSAGE"
 
@@ -68,6 +75,7 @@ jobs:
           scripts/config --file out/.config -e MODULE_SIG
           scripts/config --file out/.config -e MODULE_SIG_ALL
           
+          # [span_2](start_span)Main Kernel Build[span_2](end_span)
           make -j$(nproc --all) O=out $MAKE_ARGS || exit 1
 
           # Build & Sign Modules
